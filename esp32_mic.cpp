@@ -1,182 +1,174 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <I2S.h>        // ESP32 I2S library
-// UART Serial2 is available by default via HardwareSerial
+#include "driver/i2s.h"
 
-// WiFi credentials
-const char* WIFI_SSID = "your-ssid";
-const char* WIFI_PASS = "your-password";
+// -------------------- WiFi --------------------
+const char* WIFI_SSID = "Ivan";
+const char* WIFI_PASS = "basuraway";
 
-// Server endpoint
-const char* SERVER_URL = "http://192.168.x.y:5000/translate";  // replace with PC IP
+// -------------------- Server --------------------
+const char* SERVER_URL = "http://10.39.36.213:5001/translate";
 
-// I2S microphone pins (from wiring above)
-const int I2S_SCK  = 26;  // Bit clock
-const int I2S_WS   = 22;  // Word select (LR clock)
-const int I2S_SD   = 21;  // Data in (from mic)
+// -------------------- I2S MIC CONFIG --------------------
+#define I2S_PORT        I2S_NUM_0
+#define SAMPLE_RATE     16000
+#define SAMPLE_BITS     I2S_BITS_PER_SAMPLE_32BIT
 
-// Audio settings
-const int SAMPLE_RATE = 16000;
-const int SAMPLE_BITS = 16;  // bits per sample
-const int RECORD_TIME_SEC = 3;  // record 3 seconds of audio
-const int NUM_SAMPLES = SAMPLE_RATE * RECORD_TIME_SEC;  // e.g., 48000 samples for 3 sec
+#define I2S_BCLK        26
+#define I2S_LRCLK       25
+#define I2S_DIN_MIC     22   // INMP441 SD pin
 
-// Buffer for audio data
-int16_t *audioBuffer;
+// 3 seconds of audio
+#define RECORD_TIME_SEC 3
+#define NUM_SAMPLES     (SAMPLE_RATE * RECORD_TIME_SEC)
 
-void setup() {
-  Serial.begin(115200);
-  // Initialize UART2 for inter-ESP32 comm (Serial2 uses default pins 16,17)
-  Serial2.begin(921600);  // high baud for faster xfer (match on other side)
-  
-  // Allocate audio buffer
-  audioBuffer = (int16_t*) malloc(NUM_SAMPLES * sizeof(int16_t));
-  if(!audioBuffer) {
-    Serial.println("Failed to allocate audio buffer");
-  }
+int32_t* sample_buffer;
 
-  // I2S Microphone configuration
-  I2S.setPins(I2S_SCK, I2S_WS, -1, I2S_SD); 
-  // We use -1 for dout because this device is input only; `I2S_SD` is used as data-in.
-  if(!I2S.begin(I2S_PHILIPS_MODE, SAMPLE_RATE, SAMPLE_BITS, I2S_SLOT_MODE_MONO)) {
-    Serial.println("Failed to start I2S!");
-    while(1);
-  }
+// -------------------- UART TO ESP32 #2 --------------------
+#define UART_TX 17      // TX2
+#define UART_RX 16      // RX2
 
-  // Connect to WiFi
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("Connecting to WiFi...");
-  while(WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected, IP: " + WiFi.localIP().toString());
+HardwareSerial SerialTwo(2);
+
+// -------------------- WAV HEADER FUNCTION --------------------
+void build_wav_header(uint8_t* header, uint32_t data_size) {
+  uint32_t file_size = data_size + 36;
+  uint32_t byte_rate = SAMPLE_RATE * 2; // 16-bit mono
+
+  memcpy(header, "RIFF", 4);
+  memcpy(header + 4, &file_size, 4);
+  memcpy(header + 8, "WAVEfmt ", 8);
+
+  uint32_t fmt_size = 16;
+  uint16_t format = 1;      // PCM
+  uint16_t channels = 1;
+  uint16_t bits = 16;
+  uint16_t block_align = 2;
+
+  memcpy(header + 16, &fmt_size, 4);
+  memcpy(header + 20, &format, 2);
+  memcpy(header + 22, &channels, 2);
+  memcpy(header + 24, &SAMPLE_RATE, 4);
+  memcpy(header + 28, &byte_rate, 4);
+  memcpy(header + 32, &block_align, 2);
+  memcpy(header + 34, &bits, 2);
+
+  memcpy(header + 36, "data", 4);
+  memcpy(header + 40, &data_size, 4);
 }
 
-void loop() {
-  // 1. Wait or trigger recording (could be a button press or serial command)
-  Serial.println("Recording for 3 seconds...");
-  size_t bytesRead = 0;
-  size_t totalRead = 0;
-  // Flush any old data
-  I2S.read(audioBuffer, I2S.available()); 
+// -------------------- SETUP --------------------
+void setup() {
+  Serial.begin(115200);
 
-  // Record loop: read samples for RECORD_TIME_SEC
-  unsigned long recordStart = millis();
-  while(totalRead < NUM_SAMPLES * sizeof(int16_t)) {
-    // Read up to remaining bytes
-    int bytesToRead = (NUM_SAMPLES * sizeof(int16_t)) - totalRead;
-    bytesRead = I2S.read((uint8_t*)audioBuffer + totalRead, bytesToRead);
-    if(bytesRead > 0) totalRead += bytesRead;
-    if(millis() - recordStart > RECORD_TIME_SEC*1000UL) break; // safety timeout
+  SerialTwo.begin(921600, SERIAL_8N1, UART_RX, UART_TX);
+  Serial.println("UART link initialized.");
+
+  // Allocate sample buffer
+  sample_buffer = (int32_t*) malloc(NUM_SAMPLES * sizeof(int32_t));
+
+  // ---------- I2S Microphone ----------
+  i2s_config_t config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = SAMPLE_BITS,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 256,
+    .use_apll = false
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_BCLK,
+    .ws_io_num = I2S_LRCLK,
+    .data_out_num = -1,
+    .data_in_num = I2S_DIN_MIC
+  };
+
+  i2s_driver_install(I2S_PORT, &config, 0, NULL);
+  i2s_set_pin(I2S_PORT, &pin_config);
+  i2s_zero_dma_buffer(I2S_PORT);
+
+  // ---------- WiFi ----------
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
   }
-  I2S.end();  // stop I2S to finish capture (or reuse it if needed later)
-  Serial.printf("Recording complete, %u bytes captured\n", totalRead);
+  Serial.println("\nConnected!");
+}
 
-  // Basic processing (optional): e.g., a simple high-pass filter to remove DC, etc.
-  // (Not implemented here, but you could iterate over audioBuffer and filter noise.)
+// -------------------- LOOP --------------------
+void loop() {
+  Serial.println("Recording...");
+  size_t total_bytes = NUM_SAMPLES * sizeof(int32_t);
+  size_t bytes_read = 0;
 
-  // 2. Prepare WAV header (44 bytes) and combine with audio data if needed
-  // For simplicity, assume 16-bit mono PCM. We'll prepare a minimal WAV header:
-  uint32_t dataSize = totalRead; 
-  uint32_t sampleRate = SAMPLE_RATE;
-  uint16_t bitsPerSample = SAMPLE_BITS;
-  uint16_t numChannels = 1;
-  uint32_t byteRate = sampleRate * numChannels * bitsPerSample/8;
-  uint16_t blockAlign = numChannels * bitsPerSample/8;
-  // WAV header fields
-  char wavHeader[44];
-  memcpy(wavHeader, "RIFF", 4);
-  uint32_t chunkSize = 36 + dataSize;
-  memcpy(wavHeader+4, &chunkSize, 4);
-  memcpy(wavHeader+8, "WAVE", 4);
-  memcpy(wavHeader+12, "fmt ", 4);
-  uint32_t subchunk1Size = 16;
-  memcpy(wavHeader+16, &subchunk1Size, 4);
-  uint16_t audioFormat = 1; // PCM
-  memcpy(wavHeader+20, &audioFormat, 2);
-  memcpy(wavHeader+22, &numChannels, 2);
-  memcpy(wavHeader+24, &sampleRate, 4);
-  memcpy(wavHeader+28, &byteRate, 4);
-  memcpy(wavHeader+32, &blockAlign, 2);
-  memcpy(wavHeader+34, &bitsPerSample, 2);
-  memcpy(wavHeader+36, "data", 4);
-  memcpy(wavHeader+40, &dataSize, 4);
+  i2s_read(I2S_PORT, sample_buffer, total_bytes, &bytes_read, portMAX_DELAY);
 
-  // 3. Send audio to server via HTTP POST
+  Serial.println("Processing audio...");
+
+  uint32_t pcm_bytes = NUM_SAMPLES * 2;
+  uint8_t* pcm_data = (uint8_t*) malloc(pcm_bytes);
+
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    int32_t s = sample_buffer[i] >> 8;
+    int16_t pcm = (int16_t) s;
+    pcm_data[i * 2]     = pcm & 0xFF;
+    pcm_data[i * 2 + 1] = pcm >> 8;
+  }
+
+  uint8_t wav_header[44];
+  build_wav_header(wav_header, pcm_bytes);
+
+  uint32_t wav_size = 44 + pcm_bytes;
+  uint8_t* wav_file = (uint8_t*) malloc(wav_size);
+  memcpy(wav_file, wav_header, 44);
+  memcpy(wav_file + 44, pcm_data, pcm_bytes);
+
+  free(pcm_data);
+
+  // ---------- HTTP POST ----------
   HTTPClient http;
   http.begin(SERVER_URL);
   http.addHeader("Content-Type", "audio/wav");
-  
-  // We will send the header and data in one request. We can do this by first combining them.
-  uint8_t *postData = (uint8_t*) malloc(44 + dataSize);
-  memcpy(postData, wavHeader, 44);
-  memcpy(postData+44, audioBuffer, dataSize);
-  
-  Serial.println("Uploading audio to server...");
-  unsigned long httpStart = millis();
-  int httpResponseCode = http.POST(postData, 44 + dataSize);
-  free(postData);
-  if(httpResponseCode != 200) {
-    Serial.printf("Server returned %d!\n", httpResponseCode);
-    String err = http.getString();
-    Serial.println("Error response: " + err);
+
+  Serial.println("Sending to server...");
+  int code = http.POST(wav_file, wav_size);
+
+  if (code != 200) {
+    Serial.printf("Server error: %d\n", code);
     http.end();
-    // Handle error (retry or break)
-    delay(5000);
     return;
   }
-  // 4. Receive response audio
-  WiFiClient * stream = http.getStreamPtr();
-  int totalLen = http.getSize(); // may be -1 if Transfer-Encoding: chunked
-  Serial.printf("Response content length: %d\n", totalLen);
-  
-  // Read response data into buffer
-  const size_t MAX_RESP = 100000; // 100 KB buffer
-  static uint8_t *respBuf = (uint8_t*) malloc(MAX_RESP);
-  size_t bytesReadResp = 0;
-  while(http.connected() && (totalLen < 0 || bytesReadResp < totalLen)) {
-    if(stream->available()) {
-      int len = stream->readBytes(respBuf + bytesReadResp, MAX_RESP - bytesReadResp);
-      if(len > 0) bytesReadResp += len;
-      // If response is chunked (totalLen==-1), break on some condition (e.g., if we see WAV "RIFF" end).
-    }
-  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  const int MAX_AUDIO = 150000;
+  uint8_t* rx = (uint8_t*) malloc(MAX_AUDIO);
+  int read_bytes = stream->readBytes(rx, MAX_AUDIO);
   http.end();
-  unsigned long httpTime = millis() - httpStart;
-  Serial.printf("Received %u bytes audio from server in %.2f s\n", bytesReadResp, httpTime/1000.0);
 
-  // Optionally, parse any text (not applicable in our raw response approach, but if we had JSON, parse here)
+  Serial.printf("Received %d bytes\n", read_bytes);
 
-  // 5. Send audio to ESP32 #2 via UART
-  // Construct UART packet with SOP, length, data, checksum, EOP
-  uint16_t audioLen = bytesReadResp;
-  uint8_t csum = 0;
-  for(size_t i=0; i<audioLen; ++i) {
-    csum ^= respBuf[i];
-  }
-  Serial2.write(0xAA);                         // SOP
-  Serial2.write((uint8_t)(audioLen & 0xFF));   // LEN LSB
-  Serial2.write((uint8_t)(audioLen >> 8));     // LEN MSB
-  Serial2.write(respBuf, audioLen);            // Data
-  Serial2.write(csum);                        // Checksum
-  Serial2.write(0x55);                        // EOP
-  Serial.printf("Sent %u bytes to ESP32 #2 over UART\n", audioLen);
-  
-  // 6. (Optional) Wait for ACK
-  unsigned long t0 = millis();
-  while(millis() - t0 < 2000) {
-    if(Serial2.available()) {
-      int b = Serial2.read();
-      if(b == 0x06) { // let's say 0x06 is ACK
-        Serial.println("ACK received from ESP32 #2");
-        break;
-      } else {
-        Serial.printf("Received unexpected 0x%02X from ESP32 #2\n", b);
-      }
-    }
-  }
-  
-  Serial.println("Translation cycle complete.\n");
-  delay(5000);  // wait before next cycle (or wait for new trigger)
+  // ---------- SEND OVER UART ----------
+  uint16_t payload_len = read_bytes;
+  uint8_t checksum = 0;
+  for (int i = 0; i < payload_len; i++) checksum ^= rx[i];
+
+  SerialTwo.write(0xAA);               
+  SerialTwo.write(payload_len & 0xFF);
+  SerialTwo.write(payload_len >> 8);
+  SerialTwo.write(rx, payload_len);
+  SerialTwo.write(checksum);
+  SerialTwo.write(0x55);
+
+  Serial.println("Sent to ESP32 #2.");
+
+  free(rx);
+  free(wav_file);
+
+  delay(5000);
 }

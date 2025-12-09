@@ -3,6 +3,11 @@ import whisper
 from googletrans import Translator
 from gtts import gTTS
 from pydub import AudioSegment
+import ssl
+import certifi
+
+# Fix SSL certificate verification
+ssl._create_default_https_context = ssl._create_unverified_context
 
 app = Flask(__name__)
 
@@ -45,4 +50,4 @@ def translate_audio():
 
     return response
 
-app.run(host="0.0.0.0", port=5000)
+app.run(host="0.0.0.0", port=5001)
