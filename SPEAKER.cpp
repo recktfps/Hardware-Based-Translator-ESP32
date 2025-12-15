@@ -3,12 +3,13 @@
 FIle: Speaker.cpp 
 Functionality: Uses our I2S speaker and amplifier at an amplitude of 3000 to give us speech output. 
 Designed a Google Translate Flask server that decodes input text into Spanish. This program lets us 
-hear that audio.
+hear that audio. This version lets the speaker play LIVE audio instead of being button triggered.
 Course: CECS 460 
 Students: James Henry, Ivan Martinez, Sheesh
 
-*/
 
+
+*/
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -18,11 +19,11 @@ Students: James Henry, Ivan Martinez, Sheesh
 // ------------------------------
 // WIFI SETTINGS
 // ------------------------------
-const char* ssid     = "WIFI NAME";
-const char* password = "WIFI PW";
+const char* ssid     = "WIFI";
+const char* password = "PW";
 
-// Whisper server WAV endpoint
-String serverURL = "IP SERVER FROM PYTHON TERMINAL Running on 2nd line;
+// Whisper server WAV → TTS endpoint
+String serverURL = "http://nnn.nnn.nn.nnn:nnnn/translate";
 
 // -------------------------
 // I2S PINS for MAX98357A
@@ -70,10 +71,19 @@ uint8_t* audioBuffer = nullptr;
 int      audioLength = 0;
 
 // ------------------------------
-// Helpers
+// Simple hash to detect new audio
 // ------------------------------
+uint32_t simpleHash(const uint8_t* data, size_t len) {
+  uint32_t h = 5381;
+  for (size_t i = 0; i < len; i++) {
+    h = ((h << 5) + h) + data[i]; // h * 33 + data[i]
+  }
+  return h;
+}
 
-// Play square-wave test tone, same style as your working script
+// ------------------------------
+// Test tone (same style as before)
+// ------------------------------
 void playTestTone(float seconds) {
   Serial.println("Playing test tone...");
 
@@ -83,7 +93,7 @@ void playTestTone(float seconds) {
   for (int i = 0; i < totalSamples; i++) {
     int16_t sample;
 
-    // SAME LOGIC as your original script
+    // SAME square-wave logic as our original script
     if (sin(phase) > 0)
       sample = AMPLITUDE;
     else
@@ -99,66 +109,86 @@ void playTestTone(float seconds) {
   Serial.println("Test tone done.");
 }
 
-// Request WAV from server and store in RAM
-void requestAudio() {
+// ------------------------------
+// Request WAV from server
+// Returns true if we got valid audio
+// and outputs a hash of the PCM data.
+// ------------------------------
+bool requestAudio(uint32_t &outHash) {
   HTTPClient http;
 
-  Serial.println("Requesting translated audio...");
+  Serial.println("Checking server for translation...");
   http.begin(serverURL);
   http.addHeader("Content-Type", "application/json");
 
   int httpCode = http.POST("{\"request\":\"speak\"}");
 
-  if (httpCode == 200) {
-    int contentLength = http.getSize();
-    WiFiClient *stream = http.getStreamPtr();
-
-    Serial.print("HTTP 200 OK, content length: ");
-    Serial.println(contentLength);
-
-    if (contentLength <= 44) {
-      Serial.println("ERROR: Invalid or too-small WAV.");
-      http.end();
-      return;
-    }
-
-    // Free old buffer if any
-    if (audioBuffer != nullptr) {
-      free(audioBuffer);
-      audioBuffer = nullptr;
-    }
-
-    audioBuffer = (uint8_t*)malloc(contentLength);
-    if (!audioBuffer) {
-      Serial.println("ERROR: malloc failed.");
-      http.end();
-      return;
-    }
-
-    // Read all data
-    int bytesRead = 0;
-    while (bytesRead < contentLength) {
-      int r = stream->readBytes(audioBuffer + bytesRead, contentLength - bytesRead);
-      if (r <= 0) {
-        Serial.println("ERROR: Stream read failed.");
-        break;
-      }
-      bytesRead += r;
-    }
-
-    audioLength = bytesRead;
-    Serial.print("Received bytes: ");
-    Serial.println(audioLength);
-
-  } else {
+  if (httpCode != 200) {
     Serial.print("HTTP Error: ");
     Serial.println(httpCode);
+    http.end();
+    return false;
   }
 
+  int contentLength = http.getSize();
+  WiFiClient *stream = http.getStreamPtr();
+
+  Serial.print("HTTP 200 OK, content length: ");
+  Serial.println(contentLength);
+
+  if (contentLength <= 44) {
+    Serial.println("ERROR: Invalid or too-small WAV.");
+    http.end();
+    return false;
+  }
+
+  // Free old buffer
+  if (audioBuffer != nullptr) {
+    free(audioBuffer);
+    audioBuffer = nullptr;
+  }
+
+  audioBuffer = (uint8_t*)malloc(contentLength);
+  if (!audioBuffer) {
+    Serial.println("ERROR: malloc failed.");
+    http.end();
+    return false;
+  }
+
+  // Read all data
+  int bytesRead = 0;
+  while (bytesRead < contentLength) {
+    int r = stream->readBytes(audioBuffer + bytesRead, contentLength - bytesRead);
+    if (r <= 0) {
+      Serial.println("ERROR: Stream read failed.");
+      break;
+    }
+    bytesRead += r;
+  }
+
+  audioLength = bytesRead;
+  Serial.print("Received bytes: ");
+  Serial.println(audioLength);
+
   http.end();
+
+  if (audioLength <= 44) {
+    Serial.println("ERROR: Not enough data after read.");
+    return false;
+  }
+
+  // Hash only the PCM portion (skip 44-byte WAV header)
+  const int WAV_HEADER_SIZE = 44;
+  uint8_t* pcmData = audioBuffer + WAV_HEADER_SIZE;
+  int      pcmBytes = audioLength - WAV_HEADER_SIZE;
+
+  outHash = simpleHash(pcmData, pcmBytes);
+  return true;
 }
 
-// Play the WAV we downloaded using raw I2S
+// ------------------------------
+// Play audio from current buffer
+// ------------------------------
 void playAudioFromBuffer() {
   if (!audioBuffer || audioLength <= 44) {
     Serial.println("ERROR: No valid audio in buffer.");
@@ -167,13 +197,9 @@ void playAudioFromBuffer() {
 
   Serial.println("Playing translated audio...");
 
-  // Assume standard PCM WAV with 44-byte header, 16-bit mono
   const int WAV_HEADER_SIZE = 44;
   uint8_t* pcmData = audioBuffer + WAV_HEADER_SIZE;
   int      pcmBytes = audioLength - WAV_HEADER_SIZE;
-
-  // If your WAV sample rate != SAMPLE_RATE, you can adjust here:
-  // i2s_set_sample_rates(I2S_NUM_0, SAMPLE_RATE);
 
   size_t bytes_written = 0;
   i2s_write(I2S_NUM_0, pcmData, pcmBytes, &bytes_written, portMAX_DELAY);
@@ -203,31 +229,48 @@ void setup() {
   Serial.print("ESP32 IP: ");
   Serial.println(WiFi.localIP());
 
-  // Install and start I2S driver (EXACTLY like your working script)
+  // I2S init (same as our working tone script)
   i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &pin_config);
   i2s_zero_dma_buffer(I2S_NUM_0);
 
   Serial.println("Node 2 Ready.");
-  Serial.println("Type 't' for test tone, 'p' to fetch+play translation.");
+  Serial.println("Type 't' for test tone. Translations will play automatically.");
 }
 
 // ------------------------------
 // Loop
 // ------------------------------
 void loop() {
+  // Manual test tone (for sanity check)
   if (Serial.available()) {
     char c = Serial.read();
-
     if (c == 't') {
-      // Test tone like your original script, but for 3 seconds
-      playTestTone(3.0f);
+      playTestTone(3.0f);   // 3-second test tone
     }
+  }
 
-    if (c == 'p') {
-      // Fetch WAV from server and play it
-      requestAudio();
-      playAudioFromBuffer();
+  // --- Auto-poll server for LAST translation and play ONCE ---
+
+  static uint32_t lastHash = 0;
+  static bool haveLastHash = false;
+  static unsigned long lastCheckMs = 0;
+  const unsigned long CHECK_INTERVAL_MS = 1000;  // poll once per second
+
+  unsigned long now = millis();
+  if (now - lastCheckMs >= CHECK_INTERVAL_MS) {
+    lastCheckMs = now;
+
+    uint32_t newHash = 0;
+    if (requestAudio(newHash)) {
+      if (!haveLastHash || newHash != lastHash) {
+        Serial.println("New translation detected. Playing once.");
+        lastHash = newHash;
+        haveLastHash = true;
+        playAudioFromBuffer();
+      } else {
+        Serial.println("Same translation as last time, not playing.");
+      }
     }
   }
 }
