@@ -15,11 +15,11 @@ Class: CECS 460 - System on Chip Design
 // ------------------------------
 // WiFi Settings
 // ------------------------------
-const char* ssid = "GreatVibes";
-const char* password = "Wandap1234";
+const char* ssid = "WIFI NAME";
+const char* password = "PASSWORD";
 
 // Flask server IP (your computer)
-String serverURL = "http://192.168.12.119:5001/stt";
+String serverURL = "IP FOR SERVER";
 // ------------------------------
 // Microphone Pins (INMP441)
 // ------------------------------
