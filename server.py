@@ -1,3 +1,6 @@
+# SEVER FOR OUR TRANSLATOR (ESP32) 
+# FINAL IMPLEMENTATION WORKS 100% 
+
 from flask import Flask, request, jsonify, send_file
 import whisper
 from googletrans import Translator
